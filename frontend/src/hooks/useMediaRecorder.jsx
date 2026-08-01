@@ -26,6 +26,7 @@ export const useMediaRecorder = (options = {}) => {
   const animationFrameRef = useRef(null);
 
   const startTimer = useCallback(() => {
+    stopTimer();
     timerRef.current = setInterval(() => {
       setDuration((prev) => prev + 1);
     }, 1000);
@@ -82,29 +83,35 @@ export const useMediaRecorder = (options = {}) => {
       setError(null);
       chunksRef.current = [];
 
-      // Get screen stream
+      // Optimized display media request with framerate constraints to avoid freezes
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "monitor" },
+        video: { 
+          displaySurface: "monitor",
+          frameRate: { ideal: 30, max: 30 },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        },
         audio: true,
       });
       screenStreamRef.current = screenStream;
 
       const audioTracks = [];
 
-      // Get audio stream if enabled
+      // Get mic audio stream if enabled
       if (includeAudio) {
         try {
           const audioStream = await navigator.mediaDevices.getUserMedia({
             audio: {
               echoCancellation: true,
               noiseSuppression: true,
+              autoGainControl: true,
               sampleRate: 44100,
             },
           });
           audioStreamRef.current = audioStream;
           audioTracks.push(...audioStream.getAudioTracks());
         } catch (audioErr) {
-          console.warn("Could not access microphone:", audioErr);
+          console.warn("Microphone access warning:", audioErr);
         }
       }
 
@@ -118,17 +125,16 @@ export const useMediaRecorder = (options = {}) => {
       if (includeWebcam) {
         try {
           const webcamStreamData = await navigator.mediaDevices.getUserMedia({
-            video: { width: 1280, height: 720, facingMode: "user" },
+            video: { width: 1280, height: 720, facingMode: "user", frameRate: { ideal: 30 } },
           });
           webcamStreamRef.current = webcamStreamData;
           setWebcamStream(webcamStreamData);
         } catch (webcamErr) {
-          console.warn("Could not access webcam:", webcamErr);
+          console.warn("Webcam access warning:", webcamErr);
         }
       }
 
-      // === CANVAS MERGING LOGIC ===
-      // Setup hidden video elements
+      // Setup hidden video element for screen stream
       const screenVideo = document.createElement("video");
       screenVideo.srcObject = screenStream;
       screenVideo.muted = true;
@@ -144,18 +150,18 @@ export const useMediaRecorder = (options = {}) => {
         pointerEvents: 'none'
       });
       document.body.appendChild(screenVideo);
-      screenVideo.play().catch(console.error);
+      await screenVideo.play().catch(console.warn);
       screenVideoRef.current = screenVideo;
 
-      // Wait for screen video to have metadata to set canvas size
       await new Promise((resolve) => {
-        screenVideo.onloadedmetadata = () => resolve();
+        if (screenVideo.readyState >= 1) resolve();
+        else screenVideo.onloadedmetadata = () => resolve();
       });
 
       const canvas = document.createElement("canvas");
-      canvas.width = screenVideo.videoWidth;
-      canvas.height = screenVideo.videoHeight;
-      const ctx = canvas.getContext("2d");
+      canvas.width = screenVideo.videoWidth || 1920;
+      canvas.height = screenVideo.videoHeight || 1080;
+      const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
       canvasRef.current = canvas;
 
       let webcamVideo = null;
@@ -175,64 +181,65 @@ export const useMediaRecorder = (options = {}) => {
           pointerEvents: 'none'
         });
         document.body.appendChild(webcamVideo);
-        webcamVideo.play().catch(console.error);
+        await webcamVideo.play().catch(console.warn);
         webcamVideoRef.current = webcamVideo;
-        
-        // Wait for webcam metadata as well to know its aspect ratio
+
         await new Promise((resolve) => {
-          webcamVideo.onloadedmetadata = () => resolve();
+          if (webcamVideo.readyState >= 1) resolve();
+          else webcamVideo.onloadedmetadata = () => resolve();
         });
       }
 
-      const drawFrame = () => {
-        if (!ctx) return;
-        
-        // Draw screen stream
-        if (screenVideo.readyState >= 2) {
-          ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
-        }
+      // Smooth, 30 FPS throttled canvas drawing loop
+      let lastDrawTime = 0;
+      const targetInterval = 1000 / 30; // 33.3ms for 30 FPS
 
-        // Draw webcam stream as Picture-in-Picture in bottom right
-        if (webcamVideo && webcamVideo.readyState >= 2) {
-          const padding = 20;
-          // Make webcam 20% of the canvas width
-          const camWidth = canvas.width * 0.2;
-          const camHeight = (webcamVideo.videoHeight / webcamVideo.videoWidth) * camWidth;
-          
-          const x = canvas.width - camWidth - padding;
-          const y = canvas.height - camHeight - padding;
+      const drawFrame = (timestamp) => {
+        if (!ctx || !screenVideoRef.current) return;
 
-          // Draw a small border/shadow for webcam
-          ctx.save();
-          ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
-          ctx.shadowBlur = 10;
-          ctx.shadowOffsetX = 2;
-          ctx.shadowOffsetY = 2;
-          ctx.lineWidth = 4;
-          ctx.strokeStyle = "white";
-          ctx.strokeRect(x, y, camWidth, camHeight);
-          ctx.drawImage(webcamVideo, x, y, camWidth, camHeight);
-          ctx.restore();
+        if (timestamp - lastDrawTime >= targetInterval) {
+          lastDrawTime = timestamp;
+
+          // Draw screen video frame if live
+          if (screenVideo.readyState >= 2) {
+            ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+          }
+
+          // Draw webcam overlay if active
+          if (webcamVideo && webcamVideo.readyState >= 2) {
+            const padding = 20;
+            const camWidth = canvas.width * 0.2;
+            const camHeight = (webcamVideo.videoHeight / webcamVideo.videoWidth) * camWidth;
+            const x = canvas.width - camWidth - padding;
+            const y = canvas.height - camHeight - padding;
+
+            ctx.save();
+            ctx.shadowColor = "rgba(0, 0, 0, 0.4)";
+            ctx.shadowBlur = 8;
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = "#ffffff";
+            ctx.strokeRect(x, y, camWidth, camHeight);
+            ctx.drawImage(webcamVideo, x, y, camWidth, camHeight);
+            ctx.restore();
+          }
         }
 
         animationFrameRef.current = requestAnimationFrame(drawFrame);
       };
 
-      // Start drawing loop
-      drawFrame();
+      animationFrameRef.current = requestAnimationFrame(drawFrame);
 
-      // Capture stream from canvas at 30fps
+      // Capture stream from canvas at 30 FPS
       const canvasStream = canvas.captureStream(30);
       const videoTracks = canvasStream.getVideoTracks();
 
-      // Combine video from canvas and audio tracks
       const combinedTracks = [...videoTracks, ...audioTracks];
       const combinedStream = new MediaStream(combinedTracks);
 
       const preferredMimeTypes = [
         "video/webm;codecs=vp9,opus",
         "video/webm;codecs=vp8,opus",
-        "video/webm;codecs=vp8",
+        "video/webm;codecs=h264,opus",
         "video/webm",
       ];
 
@@ -246,7 +253,7 @@ export const useMediaRecorder = (options = {}) => {
         : new MediaRecorder(combinedStream);
 
       mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
+        if (event.data && event.data.size > 0) {
           chunksRef.current.push(event.data);
         }
       };
@@ -260,19 +267,20 @@ export const useMediaRecorder = (options = {}) => {
         stopTimer();
       };
 
-      // Handle when user stops sharing screen via browser UI
+      // Auto-stop when user ends screen share via browser bar
       screenStream.getVideoTracks()[0].onended = () => {
-        if (mediaRecorderRef.current?.state !== "inactive") {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
           stopRecording();
         }
       };
 
       mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(1000);
+      mediaRecorder.start(1000); // Send data chunk every second
       setState("recording");
       setDuration(0);
       startTimer();
     } catch (err) {
+      console.error("Failed to start screen recording:", err);
       setError(
         err instanceof Error ? err.message : "Failed to start recording"
       );

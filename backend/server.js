@@ -1,4 +1,7 @@
 import express from 'express';
+import http from 'http';
+import { Server as SocketIOServer } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
 import mongoose from 'mongoose';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -14,6 +17,10 @@ import authRoutes from './routes/auth.js';
 import recordingRoutes from './routes/recordings.js';
 import userRoutes from './routes/users.js';
 
+import { initRedis, getRedisStatus } from './config/redis.js';
+import { setupSocketHandler } from './socket/socketHandler.js';
+import { requestMetricsMiddleware, getSystemMetrics } from './middleware/monitoring.js';
+
 // Configuration
 dotenv.config();
 
@@ -21,8 +28,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const server = http.createServer(app);
+const PORT = process.env.PORT || 5001;
 const isProduction = process.env.NODE_ENV === 'production';
+
 const uploadDir = resolveUploadDir({
   isProduction,
   projectRootDir: __dirname
@@ -36,18 +45,9 @@ const allowedOrigins = [
 ].filter(Boolean);
 
 const isAllowedOrigin = (origin) => {
-  if (!origin) {
-    return true;
-  }
-
-  if (allowedOrigins.includes(origin)) {
-    return true;
-  }
-
-  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
-    return true;
-  }
-
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return true;
   return /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
 };
 
@@ -56,7 +56,6 @@ const corsOptions = {
     if (isAllowedOrigin(origin)) {
       return callback(null, true);
     }
-
     const corsError = new Error(`Not allowed by CORS: ${origin}`);
     corsError.status = 403;
     return callback(corsError);
@@ -66,25 +65,50 @@ const corsOptions = {
   allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization']
 };
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 1000, // limit each IP to 1000 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
+// Initialize Socket.IO with CORS & Transport settings
+const io = new SocketIOServer(server, {
+  cors: corsOptions,
+  transports: ['websocket', 'polling'],
+  pingTimeout: 20000,
+  pingInterval: 10000
 });
 
-// Middleware
+// Setup Redis Adapter for multi-instance scaling if Redis is present
+const { pubClient, subClient } = initRedis();
+if (pubClient && subClient) {
+  pubClient.on('ready', () => {
+    try {
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log('✅ Socket.IO Redis adapter attached');
+    } catch (adapterErr) {
+      console.warn('⚠️ Could not attach Redis adapter:', adapterErr.message);
+    }
+  });
+}
+
+// Setup real-time WebRTC room signaling
+setupSocketHandler(io);
+
+// Rate limiting middleware
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: parseInt(process.env.RATE_LIMIT_MAX) || 10000, // configurable high-throughput limit
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests, please try again later.' }
+});
+
+// Middleware stack
+app.use(requestMetricsMiddleware);
 app.use(compression());
-app.use(helmet({
-  crossOriginResourcePolicy: false
-}));
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(limiter);
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Serve static files (recordings) with proper headers
+// Serve static recordings
 app.use('/uploads', (req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -97,12 +121,23 @@ app.use('/api/auth', authRoutes);
 app.use('/api/recordings', recordingRoutes);
 app.use('/api/users', userRoutes);
 
-// Health check endpoint
+// Enhanced Health check & System Monitoring endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'ScreenCast API is running' });
+  const metrics = getSystemMetrics(io);
+  const redisInfo = getRedisStatus();
+  const dbState = mongoose.connection.readyState;
+  const dbStatus = dbState === 1 ? 'connected' : dbState === 2 ? 'connecting' : 'disconnected';
+
+  res.json({
+    status: dbState === 1 ? 'OK' : 'DEGRADED',
+    timestamp: new Date().toISOString(),
+    database: { status: dbStatus },
+    redis: redisInfo,
+    metrics
+  });
 });
 
-// Root endpoint for deployment sanity checks
+// Root endpoint
 app.get('/', (req, res) => {
   res.json({
     message: 'ScreenCast backend is running',
@@ -110,43 +145,18 @@ app.get('/', (req, res) => {
   });
 });
 
-// Test endpoint to check file serving
-app.get('/api/test-upload/:userId/:filename', (req, res) => {
-  const { userId, filename } = req.params;
-  const filePath = path.join(uploadDir, userId, filename);
-
-  if (fs.existsSync(filePath)) {
-    const protocol = req.protocol || 'http';
-    const host = req.get('host');
-    const fullUrl = `${protocol}://${host}/uploads/${userId}/${filename}`;
-
-    res.json({
-      exists: true,
-      path: filePath,
-      url: fullUrl,
-      size: fs.statSync(filePath).size
-    });
-  } else {
-    res.status(404).json({
-      exists: false,
-      path: filePath,
-      message: 'File not found'
-    });
-  }
-});
-
 // Error handling middleware
 app.use((err, req, res, next) => {
   const statusCode = err.status || (err.name === 'MulterError' ? 400 : 500);
   if (statusCode >= 500) {
-    console.error(err.stack || err.message);
+    console.error('[Error]', err.stack || err.message);
   } else {
-    console.warn(err.message);
+    console.warn('[Warning]', err.message);
   }
 
   const isClientError = statusCode >= 400 && statusCode < 500;
-
   let message = 'Something went wrong!';
+
   if (statusCode === 403) {
     message = 'CORS origin is not allowed';
   } else if (isClientError) {
@@ -164,7 +174,7 @@ app.use((req, res) => {
   res.status(404).json({ message: 'Route not found' });
 });
 
-// MongoDB connection
+// MongoDB connection with connection pool optimization
 let isConnected = false;
 let connectionPromise = null;
 
@@ -185,18 +195,19 @@ export const connectDB = async () => {
 
     connectionPromise = mongoose.connect(process.env.MONGODB_URI, {
       bufferCommands: false,
-      maxPoolSize: 50,
+      maxPoolSize: 100, // High throughput connection pool
+      minPoolSize: 10,
       serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000
     });
 
     await connectionPromise;
-
     isConnected = true;
-    console.log('Connected to MongoDB');
+    console.log('✅ Connected to MongoDB with poolSize=100');
   } catch (error) {
     connectionPromise = null;
     isConnected = false;
-    console.error('MongoDB connection error:', error);
+    console.error('MongoDB connection error:', error.message);
     throw error;
   }
 };
@@ -206,12 +217,20 @@ connectDB().catch((error) => {
   console.error('Initial DB connection failed:', error.message);
 });
 
-// Start server in local development
-if (process.env.NODE_ENV !== 'production') {
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
-}
+// Start HTTP & Socket.IO server
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ Error: Port ${PORT} is already in use by another process.`);
+    console.error(`👉 You can free the port by running: fuser -k ${PORT}/tcp`);
+    process.exit(1);
+  } else {
+    console.error('Server error:', err);
+  }
+});
 
-// For Vercel deployment - don't start server
+server.listen(PORT, () => {
+  console.log(`🚀 ScreenCast Server running on port ${PORT}`);
+});
+
+export { app, server, io };
 export default app;
