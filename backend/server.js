@@ -212,25 +212,26 @@ export const connectDB = async () => {
   }
 };
 
-// Initialize DB connection
-connectDB().catch((error) => {
-  console.error('Initial DB connection failed:', error.message);
-});
+// Initialize DB connection when running standalone server
+if (!process.env.VERCEL) {
+  connectDB().catch((error) => {
+    console.error('Initial DB connection failed:', error.message);
+  });
 
-// Start HTTP & Socket.IO server
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`❌ Error: Port ${PORT} is already in use by another process.`);
-    console.error(`👉 You can free the port by running: fuser -k ${PORT}/tcp`);
-    process.exit(1);
-  } else {
-    console.error('Server error:', err);
-  }
-});
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ Error: Port ${PORT} is already in use by another process.`);
+      console.error(`👉 You can free the port by running: fuser -k ${PORT}/tcp`);
+      process.exit(1);
+    } else {
+      console.error('Server error:', err);
+    }
+  });
 
-server.listen(PORT, () => {
-  console.log(`🚀 ScreenCast Server running on port ${PORT}`);
-});
+  server.listen(PORT, () => {
+    console.log(`🚀 ScreenCast Server running on port ${PORT}`);
+  });
+}
 
 export { app, server, io };
 export default app;
