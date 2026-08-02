@@ -1,19 +1,9 @@
-let cachedApp;
-let ensureDbConnection;
+import app, { connectDB } from '../server.js';
 
 export default async function handler(req, res) {
 	try {
-		if (!cachedApp) {
-			const module = await import('../server.js');
-			cachedApp = module.default;
-			ensureDbConnection = module.connectDB;
-		}
-
-		if (typeof ensureDbConnection === 'function') {
-			await ensureDbConnection();
-		}
-
-		return cachedApp(req, res);
+		await connectDB();
+		return app(req, res);
 	} catch (error) {
 		console.error('Server initialization error:', error);
 		return res.status(500).json({
