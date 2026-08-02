@@ -13,11 +13,17 @@ const memoryStore = new Map();
 export const initRedis = () => {
   if (pubClient) return { pubClient, subClient, redisCacheClient, isRedisConnected };
 
+  // If no REDIS_URL is configured in serverless/production, default to in-memory fallback without attempting localhost TCP connections
+  if (!process.env.REDIS_URL && (process.env.VERCEL || process.env.NODE_ENV === 'production')) {
+    console.log('ℹ️ REDIS_URL is not set. Using in-memory caching fallback.');
+    return { pubClient: null, subClient: null, redisCacheClient: null, isRedisConnected: false };
+  }
+
   try {
     const options = {
       retryStrategy(times) {
         if (times > 5) {
-          console.warn('⚠️ Redis server unreachable. Falling back to in-memory caching and local socket adapter.');
+          console.warn('⚠️ Redis server unreachable. Falling back to in-memory caching.');
           return null;
         }
         return Math.min(times * 100, 3000);
@@ -31,14 +37,18 @@ export const initRedis = () => {
     subClient = pubClient.duplicate();
     redisCacheClient = pubClient.duplicate();
 
+    const handleRedisError = (err) => {
+      isRedisConnected = false;
+    };
+
     pubClient.on('connect', () => {
       isRedisConnected = true;
       console.log('✅ Redis client connected successfully');
     });
 
-    pubClient.on('error', () => {
-      isRedisConnected = false;
-    });
+    pubClient.on('error', handleRedisError);
+    subClient.on('error', handleRedisError);
+    redisCacheClient.on('error', handleRedisError);
 
     pubClient.connect().catch(() => {});
     subClient.connect().catch(() => {});

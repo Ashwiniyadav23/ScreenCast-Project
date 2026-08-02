@@ -193,17 +193,18 @@ export const connectDB = async () => {
       throw new Error('MONGODB_URI environment variable is not set');
     }
 
+    const isVercel = Boolean(process.env.VERCEL);
     connectionPromise = mongoose.connect(process.env.MONGODB_URI, {
       bufferCommands: false,
-      maxPoolSize: 100, // High throughput connection pool
-      minPoolSize: 10,
+      maxPoolSize: isVercel ? 10 : 100,
+      minPoolSize: isVercel ? 0 : 10,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000
     });
 
     await connectionPromise;
     isConnected = true;
-    console.log('✅ Connected to MongoDB with poolSize=100');
+    console.log(`✅ Connected to MongoDB (serverless=${isVercel})`);
   } catch (error) {
     connectionPromise = null;
     isConnected = false;
